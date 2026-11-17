@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "Manero Aquaculture",
+    "slug": "manero-aquaculture",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#F7F8F6"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "id.manero.aquaculture"
+    },
+    "android": {
+      "package": "id.manero.aquaculture",
+      "permissions": ["INTERNET"]
+    }
+  }
+}
