@@ -1,91 +1,202 @@
-import React, { useEffect, useState } from "react";
-import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
-import { StoredAlert, getCalibration, saveCalibration } from "../storage";
-import { SplitPoints } from "../engine/c45";
+import React, { useEffect, useMemo, useState } from "react";
+import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { idealRanges, SplitPoints, splitPoints, toleranceRanges } from "../engine/c45";
+import { SensorCalibration, StoredAlert, defaultSensorCalibration } from "../storage";
+import { SensorValues } from "../engine/c45";
 import { colors, fonts, radius } from "../theme";
-import { ActionButton, Card, Pill, SectionTitle } from "../components/FieldUI";
+import { ActionButton, Card, Pill, RangeSlider, SectionTitle } from "../components/FieldUI";
 import { DeviceProps } from "./types";
 
-export default function DeviceScreen({ deviceId, endpoint, onSave, alerts, onError, thresholds, onSaveThresholds }: DeviceProps) {
+const intensiveProfile: SplitPoints = { ph: 7.7, temperature: 29, salinityMin: 18, salinity: 26 };
+const postRainProfile: SplitPoints = { ph: 7.3, temperature: 27.5, salinityMin: 12, salinity: 22 };
+type CalibrationKey = keyof SensorCalibration;
+type ThresholdKey = keyof SplitPoints;
+
+export default function DeviceScreen({
+  deviceId,
+  endpoint,
+  reading,
+  calibration,
+  onSave,
+  onSaveSettings,
+  alerts,
+  onError,
+  thresholds,
+}: DeviceProps) {
   const [id, setId] = useState(deviceId);
   const [url, setUrl] = useState(endpoint);
-  const [calibration, setCalibration] = useState({ temperature: "0.0", ph: "0.00", salinity: "0.0" });
-  const [splitValues, setSplitValues] = useState({ ph: String(thresholds.ph), temperature: String(thresholds.temperature), salinity: String(thresholds.salinity) });
-  const [saved, setSaved] = useState(false);
+  const [draftCalibration, setDraftCalibration] = useState(calibration);
+  const [draftThresholds, setDraftThresholds] = useState(thresholds);
+  const [profileName, setProfileName] = useState(() => findProfile(thresholds));
+  const [saving, setSaving] = useState(false);
+  const [settingsFeedback, setSettingsFeedback] = useState("");
+  const rawValues: SensorValues = reading.rawValues ?? {
+    ph: reading.ph,
+    temperature: reading.temperature,
+    salinity: reading.salinity,
+  };
+  const previewValues = useMemo(() => ({
+    ph: rawValues.ph + draftCalibration.ph,
+    temperature: rawValues.temperature + draftCalibration.temperature,
+    salinity: rawValues.salinity + draftCalibration.salinity,
+  }), [draftCalibration, rawValues.ph, rawValues.salinity, rawValues.temperature]);
+
   useEffect(() => {
     setId(deviceId);
     setUrl(endpoint);
   }, [deviceId, endpoint]);
   useEffect(() => {
-    setSplitValues({ ph: String(thresholds.ph), temperature: String(thresholds.temperature), salinity: String(thresholds.salinity) });
-  }, [thresholds]);
+    setDraftCalibration(calibration);
+  }, [calibration]);
   useEffect(() => {
-    getCalibration().then((value) => setCalibration({
-      temperature: value.temperature ?? "0.0",
-      ph: value.ph ?? "0.00",
-      salinity: value.salinity ?? "0.0",
-    })).catch((error: unknown) => onError(`Gagal membaca kalibrasi: ${messageOf(error)}`));
-  }, [onError]);
+    setDraftThresholds(thresholds);
+    setProfileName(findProfile(thresholds));
+  }, [thresholds]);
 
-  async function persistCalibration() {
+  function updateOffset(key: CalibrationKey, value: number) {
+    const limit = key === "ph" ? 1 : 5;
+    const precision = key === "ph" ? 2 : 1;
+    const next = Number(Math.min(limit, Math.max(-limit, value)).toFixed(precision));
+    setDraftCalibration((current) => ({ ...current, [key]: next }));
+    setSettingsFeedback("");
+  }
+
+  function updateThreshold(key: ThresholdKey, value: number) {
+    setDraftThresholds((current) => {
+      const bounds = key === "ph"
+        ? { min: 6.5, max: 8.5 }
+        : key === "temperature"
+          ? { min: 24, max: 34 }
+          : key === "salinityMin"
+            ? { min: 5, max: 25 }
+            : { min: 15, max: 35 };
+      const bounded = Math.min(bounds.max, Math.max(bounds.min, value));
+      if (key === "salinityMin") {
+        return { ...current, salinityMin: Math.min(bounded, current.salinity) };
+      }
+      if (key === "salinity") {
+        return { ...current, salinity: Math.max(bounded, current.salinityMin) };
+      }
+      if (key === "ph") return { ...current, ph: Math.min(14, bounded) };
+      return { ...current, temperature: bounded };
+    });
+    setProfileName("Kustom");
+    setSettingsFeedback("");
+  }
+
+  function applyProfile(profile: SplitPoints, label: string) {
+    setDraftThresholds(profile);
+    setProfileName(label);
+    setSettingsFeedback("");
+  }
+
+  function zeroAllOffsets() {
+    setDraftCalibration({ ...defaultSensorCalibration });
+    setSettingsFeedback("");
+  }
+
+  async function saveSettings(nextCalibration = draftCalibration, nextThresholds = draftThresholds) {
+    setSaving(true);
     try {
-      await saveCalibration(calibration);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
+      await onSaveSettings(nextCalibration, nextThresholds);
+      setDraftCalibration(nextCalibration);
+      setDraftThresholds(nextThresholds);
+      setProfileName(findProfile(nextThresholds));
+      setSettingsFeedback("Offset dan ambang berhasil disimpan ke AsyncStorage.");
+      onError("");
+      Alert.alert("Kalibrasi diterapkan", "Offset sensor dan profil ambang berhasil disimpan ke AsyncStorage.");
     } catch (error) {
+      setSettingsFeedback("");
       onError(`Kalibrasi tidak tersimpan: ${messageOf(error)}`);
+    } finally {
+      setSaving(false);
     }
   }
+
+  function resetToFactory() {
+    Alert.alert(
+      "Reset ke Default",
+      "Semua offset dan ambang akan dikembalikan ke profil Standar Jurnal & Tambak Maneron dan langsung diterapkan.",
+      [
+        { text: "Batal", style: "cancel" },
+        { text: "Reset & Terapkan", style: "destructive", onPress: () => { void saveSettings(defaultSensorCalibration, splitPoints); } },
+      ],
+    );
+  }
+
   async function persistDevice() {
     try {
       await onSave(id.trim(), url.trim());
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
+      onError("");
+      Alert.alert("Koneksi tersimpan", "Pengaturan perangkat disimpan di perangkat ini.");
     } catch (error) {
       onError(`Pengaturan perangkat tidak tersimpan: ${messageOf(error)}`);
     }
   }
-  async function persistThresholds() {
-    try {
-      const parsed: SplitPoints = {
-        ph: parseThreshold(splitValues.ph, "pH", 0, 14),
-        temperature: parseThreshold(splitValues.temperature, "suhu", 0, 50),
-        salinity: parseThreshold(splitValues.salinity, "salinitas", 0, 50),
-      };
-      await onSaveThresholds(parsed);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
-    } catch (error) {
-      onError(`Ambang tidak tersimpan: ${messageOf(error)}`);
-    }
-  }
+
   return <>
     <SectionTitle title="Perangkat ESP32" />
     <Card>
-      <View style={styles.deviceHead}><View><Text style={styles.itemLabel}>ID PERANGKAT</Text><Text style={styles.deviceName}>{deviceId || "ESP32-MNR-A1"}</Text></View><Pill tone="neutral">REST / BRIDGE</Pill></View>
+      <View style={styles.deviceHead}><View><Text style={styles.itemLabel}>ID PERANGKAT</Text><Text style={styles.deviceName}>{deviceId || "ESP32-AQP-A1"}</Text></View><Pill tone="neutral">REST / BRIDGE</Pill></View>
       <Text style={styles.inputLabel}>ID Perangkat</Text>
-      <TextInput value={id} onChangeText={setId} autoCapitalize="characters" style={styles.input} placeholder="ESP32-MNR-A1" placeholderTextColor={colors.muted} />
+      <TextInput value={id} onChangeText={setId} autoCapitalize="characters" style={styles.input} placeholder="ESP32-AQP-A1" placeholderTextColor={colors.textSecondary} />
       <Text style={styles.inputLabel}>Endpoint REST ESP32 / Gateway</Text>
-      <TextInput value={url} onChangeText={setUrl} autoCapitalize="none" keyboardType="url" style={styles.input} placeholder="http://alamat-perangkat/api/sensors" placeholderTextColor={colors.muted} />
+      <TextInput value={url} onChangeText={setUrl} autoCapitalize="none" keyboardType="url" style={styles.input} placeholder="http://alamat-perangkat/api/sensors" placeholderTextColor={colors.textSecondary} />
       <Text style={styles.helper}>Payload JSON: {`{"temperature":29.4,"ph":7.9,"salinity":21}`}. Aktifkan mode simulasi untuk demo offline.</Text>
       <ActionButton label="Simpan koneksi" onPress={persistDevice} />
     </Card>
-    <SectionTitle title="Kalibrasi probe" trailing="OFFSET MANUAL" />
+
+    <SectionTitle title="Kalibrasi Offset Sensor" trailing="KOREKSI LAPANGAN" />
     <Card>
-      <CalibrationRow label="Suhu · DS18B20" unit="°C" value={calibration.temperature} onChange={(v) => setCalibration((old) => ({ ...old, temperature: v }))} />
-      <CalibrationRow label="Probe pH" unit="pH" value={calibration.ph} onChange={(v) => setCalibration((old) => ({ ...old, ph: v }))} />
-      <CalibrationRow label="Probe salinitas" unit="ppt" value={calibration.salinity} onChange={(v) => setCalibration((old) => ({ ...old, salinity: v }))} />
-      <Text style={styles.helper}>Offset disimpan lokal sebagai catatan kalibrasi. Terapkan nilai offset pada firmware / gateway ESP32 sebelum mengirim data produksi.</Text>
-      <ActionButton label={saved ? "Tersimpan ✓" : "Simpan offset"} onPress={persistCalibration} secondary />
+      <Text style={styles.helperTop}>Raw berasal dari sensor/API. Slider mengubah pratinjau offset; simpan menerapkan koreksi sebelum klasifikasi C4.5.</Text>
+      <View style={styles.calibrationSection}>
+        <RangeSlider label="Offset pH Air" value={draftCalibration.ph} min={-1} max={1} step={0.05} precision={2} unit="pH" showPositiveSigns showRangeUnits onChange={(value) => updateOffset("ph", value)} />
+        <View style={styles.comparisonRow}>
+          <ComparisonValue label="Raw (mentah)" value={rawValues.ph} unit="pH" precision={2} />
+          <Text style={styles.comparisonArrow}>→</Text>
+          <ComparisonValue label="Terkalibrasi (draft)" value={previewValues.ph} unit="pH" precision={2} />
+        </View>
+      </View>
+      <View style={styles.calibrationSection}>
+        <RangeSlider label="Offset Suhu DS18B20" value={draftCalibration.temperature} min={-5} max={5} step={0.1} precision={1} unit="°C" showPositiveSigns showRangeUnits onChange={(value) => updateOffset("temperature", value)} />
+        <View style={styles.comparisonRow}>
+          <ComparisonValue label="Raw (mentah)" value={rawValues.temperature} unit="°C" precision={1} />
+          <Text style={styles.comparisonArrow}>→</Text>
+          <ComparisonValue label="Terkalibrasi (draft)" value={previewValues.temperature} unit="°C" precision={1} />
+        </View>
+      </View>
+      <View style={styles.calibrationSection}>
+        <RangeSlider label="Offset Salinitas" value={draftCalibration.salinity} min={-5} max={5} step={0.1} precision={1} unit="ppt" showPositiveSigns showRangeUnits onChange={(value) => updateOffset("salinity", value)} />
+        <View style={styles.comparisonRow}>
+          <ComparisonValue label="Raw (mentah)" value={rawValues.salinity} unit="ppt" precision={1} />
+          <Text style={styles.comparisonArrow}>→</Text>
+          <ComparisonValue label="Terkalibrasi (draft)" value={previewValues.salinity} unit="ppt" precision={1} />
+        </View>
+      </View>
+      <ActionButton label="Nolkan Semua Offset" onPress={zeroAllOffsets} secondary />
+      <Text style={styles.helper}>Offset menggeser pembacaan, bukan mengganti kalibrasi multipoint probe. Pastikan firmware tidak menerapkan koreksi yang sama dua kali.</Text>
     </Card>
-    <SectionTitle title="Ambang pohon C4.5" />
+
+    <SectionTitle title="Ambang Pohon C4.5" trailing={profileName.toUpperCase()} />
     <Card>
-      <Threshold label="Root · pH air" value={splitValues.ph} onChange={(v) => setSplitValues((old) => ({ ...old, ph: v }))} ideal="rentang ideal 7.5–8.5" />
-      <Threshold label="Internal · suhu" value={splitValues.temperature} onChange={(v) => setSplitValues((old) => ({ ...old, temperature: v }))} ideal="rentang ideal 28–32°C" />
-      <Threshold label="Leaf · salinitas" value={splitValues.salinity} onChange={(v) => setSplitValues((old) => ({ ...old, salinity: v }))} ideal="rentang ideal 15–25 ppt" last />
-      <Text style={styles.helper}>Perubahan ambang diterapkan ke evaluator C4.5 dan simulator What‑If. Nilai split perlu divalidasi ulang terhadap data lapangan.</Text>
-      <ActionButton label={saved ? "Tersimpan ✓" : "Simpan ambang"} onPress={persistThresholds} secondary />
+      <Text style={styles.profileLabel}>PROFIL BUDIDAYA</Text>
+      <View style={styles.profileList}>
+        <PresetButton label="Standar Jurnal & Tambak Maneron" selected={profileName === "Standar Jurnal & Tambak Maneron"} onPress={() => applyProfile(splitPoints, "Standar Jurnal & Tambak Maneron")} />
+        <PresetButton label="Profil Intensif / Padat Tebar" selected={profileName === "Profil Intensif / Padat Tebar"} onPress={() => applyProfile(intensiveProfile, "Profil Intensif / Padat Tebar")} />
+        <PresetButton label="Profil Pasca-Hujan / Adaptasi" selected={profileName === "Profil Pasca-Hujan / Adaptasi"} onPress={() => applyProfile(postRainProfile, "Profil Pasca-Hujan / Adaptasi")} />
+      </View>
+      <RangeSlider label="ROOT · Split Point pH Ideal" value={draftThresholds.ph} min={6.5} max={8.5} step={0.05} precision={2} unit="pH" showRangeUnits onChange={(value) => updateThreshold("ph", value)} />
+      <RangeSlider label="INTERNAL · Split Point Suhu" value={draftThresholds.temperature} min={24} max={34} step={0.25} precision={2} unit="°C" showRangeUnits onChange={(value) => updateThreshold("temperature", value)} />
+      <RangeSlider label="LOWER GUARD · Batas Bawah Salinitas" value={draftThresholds.salinityMin} min={5} max={25} step={0.5} precision={1} unit="ppt" showRangeUnits onChange={(value) => updateThreshold("salinityMin", value)} />
+      <RangeSlider label="LEAF · Batas Atas / Split Salinitas" value={draftThresholds.salinity} min={15} max={35} step={0.5} precision={1} unit="ppt" showRangeUnits onChange={(value) => updateThreshold("salinity", value)} />
+      <Text style={styles.helper}>Bawaan memakai split slider terdekat: pH 7,50; suhu 28,75 °C; salinitas 25,5 ppt. Nilai jurnal 7,495; 28,755 °C; 25,635 ppt ditampilkan pada metodologi. Optimal WWF: pH {idealRanges.ph.min}–{idealRanges.ph.max}, suhu {idealRanges.temperature.min}–{idealRanges.temperature.max} °C, salinitas {idealRanges.salinity.min}–{idealRanges.salinity.max} ppt. Toleransi: pH {toleranceRanges.ph.min}–{toleranceRanges.ph.max}, suhu {toleranceRanges.temperature.min}–{toleranceRanges.temperature.max} °C, salinitas {toleranceRanges.salinity.min}–{toleranceRanges.salinity.max} ppt.</Text>
+      <ActionButton label={saving ? "Menyimpan..." : "Simpan & Terapkan Kalibrasi"} onPress={() => { void saveSettings(); }} />
+      {settingsFeedback ? <Text accessibilityRole="status" style={styles.settingsFeedback}>{settingsFeedback}</Text> : null}
+      <View style={styles.resetButton}>
+        <ActionButton label="Reset ke Default" onPress={resetToFactory} secondary />
+      </View>
     </Card>
+
     <SectionTitle title="Riwayat alert" trailing={`${alerts.length} TOTAL`} />
     <Card style={styles.alertCard}>
       <ScrollView nestedScrollEnabled style={{ maxHeight: 280 }}>
@@ -95,49 +206,69 @@ export default function DeviceScreen({ deviceId, endpoint, onSave, alerts, onErr
   </>;
 }
 
-function CalibrationRow({ label, unit, value, onChange }: { label: string; unit: string; value: string; onChange: (value: string) => void }) {
-  return <View style={styles.calibrationRow}><View><Text style={styles.calLabel}>{label}</Text><Text style={styles.calUnit}>Offset ({unit})</Text></View><TextInput value={value} onChangeText={onChange} keyboardType="decimal-pad" style={styles.offsetInput} /></View>;
+function ComparisonValue({ label, value, unit, precision }: { label: string; value: number; unit: string; precision: number }) {
+  return <View style={styles.comparisonValue}>
+    <Text style={styles.comparisonLabel}>{label}</Text>
+    <Text style={styles.comparisonNumber}>{value.toFixed(precision)} {unit}</Text>
+  </View>;
 }
 
-function Threshold({ label, value, ideal, last = false, onChange }: { label: string; value: string; ideal: string; last?: boolean; onChange: (value: string) => void }) {
-  return <View style={[styles.threshold, last && styles.noBorder]}><View><Text style={styles.thresholdLabel}>{label}</Text><Text style={styles.thresholdHint}>{ideal}</Text></View><TextInput value={value} onChangeText={onChange} keyboardType="decimal-pad" style={styles.offsetInput} /></View>;
+function PresetButton({ label, onPress, selected = false }: { label: string; onPress: () => void; selected?: boolean }) {
+  return <Pressable accessibilityRole="button" onPress={onPress} style={({ pressed }) => [styles.presetButton, selected && styles.presetButtonSelected, pressed && styles.pressed]}>
+    <Text style={[styles.presetText, selected && styles.presetTextSelected]}>{label}</Text>
+  </Pressable>;
 }
 
 function AlertRow({ alert }: { alert: StoredAlert }) {
-  return <View style={styles.alertRow}><View style={[styles.alertMark, { backgroundColor: alert.severity === "danger" ? colors.rust : colors.amber }]} /><View style={styles.alertCopy}><Text style={styles.alertMessage}>{alert.message}</Text><Text style={styles.alertTime}>{new Date(alert.timestamp).toLocaleString("id-ID")}</Text></View><Pill tone={alert.severity === "danger" ? "danger" : "warning"}>{alert.severity === "danger" ? "BAHAYA" : "WASPADA"}</Pill></View>;
+  return <View style={styles.alertRow}><View style={[styles.alertMark, { backgroundColor: alert.severity === "danger" ? colors.critical : colors.warning }]} /><View style={styles.alertCopy}><Text style={styles.alertMessage}>{alert.message}</Text><Text style={styles.alertTime}>{new Date(alert.timestamp).toLocaleString("id-ID")}</Text></View><Pill tone={alert.severity === "danger" ? "danger" : "warning"}>{alert.severity === "danger" ? "BAHAYA" : "WASPADA"}</Pill></View>;
+}
+
+function findProfile(value: SplitPoints): string {
+  if (matchesProfile(value, splitPoints)) return "Standar Jurnal & Tambak Maneron";
+  if (matchesProfile(value, intensiveProfile)) return "Profil Intensif / Padat Tebar";
+  if (matchesProfile(value, postRainProfile)) return "Profil Pasca-Hujan / Adaptasi";
+  return "Kustom";
+}
+
+function matchesProfile(value: SplitPoints, profile: SplitPoints): boolean {
+  return value.ph === profile.ph
+    && value.temperature === profile.temperature
+    && value.salinityMin === profile.salinityMin
+    && value.salinity === profile.salinity;
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function parseThreshold(value: string, label: string, min: number, max: number): number {
-  const parsed = Number(value.replace(",", "."));
-  if (!Number.isFinite(parsed) || parsed < min || parsed > max) throw new Error(`Ambang ${label} harus berupa angka antara ${min}–${max}.`);
-  return parsed;
-}
-
 const styles = StyleSheet.create({
   deviceHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 15 },
-  itemLabel: { color: colors.muted, fontFamily: fonts.bold, fontSize: 9 },
-  deviceName: { color: colors.ink, fontFamily: fonts.mono, fontSize: 13, marginTop: 4 },
-  inputLabel: { color: colors.muted, fontFamily: fonts.medium, fontSize: 10, marginTop: 10, marginBottom: 5 },
-  input: { minHeight: 42, borderRadius: radius.sm, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 11, color: colors.ink, fontFamily: fonts.mono, fontSize: 11, marginBottom: 7 },
-  helper: { color: colors.muted, fontFamily: fonts.body, fontSize: 10, lineHeight: 15, marginTop: 8, marginBottom: 12 },
-  calibrationRow: { minHeight: 54, flexDirection: "row", justifyContent: "space-between", alignItems: "center", borderBottomWidth: 1, borderColor: colors.border },
-  calLabel: { color: colors.ink, fontFamily: fonts.medium, fontSize: 11 },
-  calUnit: { color: colors.muted, fontFamily: fonts.body, fontSize: 9, marginTop: 3 },
-  offsetInput: { width: 88, textAlign: "right", color: colors.ink, backgroundColor: colors.background, borderWidth: 1, borderColor: colors.border, borderRadius: radius.sm, paddingHorizontal: 8, paddingVertical: 7, fontFamily: fonts.mono, fontSize: 12 },
-  threshold: { minHeight: 55, borderBottomWidth: 1, borderColor: colors.border, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  noBorder: { borderBottomWidth: 0 },
-  thresholdLabel: { color: colors.ink, fontFamily: fonts.medium, fontSize: 11 },
-  thresholdHint: { color: colors.muted, fontFamily: fonts.body, fontSize: 9, marginTop: 3 },
-  thresholdValue: { color: colors.teal, fontFamily: fonts.mono, fontSize: 11 },
+  itemLabel: { color: colors.textSecondary, fontFamily: fonts.bold, fontSize: 9 },
+  deviceName: { color: colors.textPrimary, fontFamily: fonts.mono, fontSize: 13, marginTop: 4 },
+  inputLabel: { color: colors.textSecondary, fontFamily: fonts.medium, fontSize: 10, marginTop: 10, marginBottom: 5 },
+  input: { minHeight: 42, borderRadius: radius.sm, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 11, color: colors.textPrimary, fontFamily: fonts.mono, fontSize: 11, marginBottom: 7 },
+  helper: { color: colors.textSecondary, fontFamily: fonts.body, fontSize: 10, lineHeight: 15, marginTop: 10, marginBottom: 12 },
+  helperTop: { color: colors.textSecondary, fontFamily: fonts.body, fontSize: 10, lineHeight: 15, marginBottom: 7 },
+  calibrationSection: { paddingBottom: 9, marginBottom: 4, borderBottomWidth: 1, borderColor: colors.border },
+  comparisonRow: { flexDirection: "row", alignItems: "center", marginTop: 9, gap: 9 },
+  comparisonValue: { flex: 1, backgroundColor: colors.bgPrimary, borderRadius: radius.sm, paddingHorizontal: 9, paddingVertical: 7 },
+  comparisonLabel: { color: colors.textSecondary, fontFamily: fonts.body, fontSize: 8 },
+  comparisonNumber: { color: colors.textPrimary, fontFamily: fonts.mono, fontSize: 10, marginTop: 3 },
+  comparisonArrow: { color: colors.brandSecondary, fontFamily: fonts.bold, fontSize: 15 },
+  presetButton: { minHeight: 38, flexGrow: 1, justifyContent: "center", alignItems: "center", borderWidth: 1, borderColor: colors.border, borderRadius: radius.sm, backgroundColor: colors.surface, paddingHorizontal: 9, paddingVertical: 7 },
+  presetButtonSelected: { backgroundColor: colors.brandTint, borderColor: colors.brandPrimary },
+  presetText: { color: colors.textSecondary, fontFamily: fonts.medium, fontSize: 9, textAlign: "center" },
+  presetTextSelected: { color: colors.brandPrimary, fontFamily: fonts.bold },
+  pressed: { opacity: 0.75 },
+  profileLabel: { color: colors.textSecondary, fontFamily: fonts.bold, fontSize: 8, letterSpacing: 0.8, marginBottom: 7 },
+  profileList: { gap: 7, marginBottom: 10 },
+  resetButton: { marginTop: 8 },
+  settingsFeedback: { color: colors.brandPrimary, backgroundColor: colors.brandTint, borderRadius: radius.sm, fontFamily: fonts.medium, fontSize: 10, lineHeight: 15, padding: 9, marginTop: 8, textAlign: "center" },
   alertCard: { padding: 0, overflow: "hidden" },
   alertRow: { flexDirection: "row", alignItems: "center", gap: 9, padding: 12, borderBottomWidth: 1, borderColor: colors.border },
   alertMark: { width: 8, height: 8, borderRadius: 4 },
   alertCopy: { flex: 1 },
-  alertMessage: { color: colors.ink, fontFamily: fonts.medium, fontSize: 10, lineHeight: 15 },
-  alertTime: { color: colors.muted, fontFamily: fonts.mono, fontSize: 8, marginTop: 3 },
-  empty: { color: colors.muted, fontFamily: fonts.body, fontSize: 11, padding: 15, lineHeight: 16 },
+  alertMessage: { color: colors.textPrimary, fontFamily: fonts.medium, fontSize: 10, lineHeight: 15 },
+  alertTime: { color: colors.textSecondary, fontFamily: fonts.mono, fontSize: 8, marginTop: 3 },
+  empty: { color: colors.textSecondary, fontFamily: fonts.body, fontSize: 11, padding: 15, lineHeight: 16 },
 });
